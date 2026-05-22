@@ -1,17 +1,17 @@
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import dotenv from "dotenv";
-import fs from "fs";
-import path from "path";
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const dotenv = require("dotenv");
+const fs = require("fs");
+const path = require("path");
 
 dotenv.config();
 
 const app = express();
 
-app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -19,474 +19,443 @@ const IMWEB_API_KEY = process.env.IMWEB_API_KEY;
 const IMWEB_SECRET_KEY = process.env.IMWEB_SECRET_KEY;
 const ORDER_VERSION = process.env.ORDER_VERSION || "v2";
 
-const SUBSCRIPTION_KEYWORDS = (process.env.SUBSCRIPTION_KEYWORDS || "정기구독")
+const SUBSCRIPTION_KEYWORDS = (process.env.SUBSCRIPTION_KEYWORDS || "정기구독,김비서 고용하기")
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
 
-const PAID_SERVICE_KEYWORDS = (process.env.PAID_SERVICE_KEYWORDS || "유료")
+const PAID_SERVICE_KEYWORDS = (process.env.PAID_SERVICE_KEYWORDS || "유료,별도결제,추가결제,유료 서비스")
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const PAYMENT_REQUEST_FILE = path.join(DATA_DIR, "payment-requests.json");
+const GOOGLE_SHEET_WEBHOOK_URL = process.env.GOOGLE_SHEET_WEBHOOK_URL || "";
+
+const DATA_DIR = path.join(__dirname, "data");
 const ORDERS_FILE = path.join(DATA_DIR, "orders.json");
 
 if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-function readJsonFile(filePath, defaultValue) {
+function readJsonFile(filePath, fallback) {
   try {
-    if (!fs.existsSync(filePath)) return defaultValue;
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
-  } catch {
-    return defaultValue;
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = fs.readFileSync(filePath, "utf8");
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch (error) {
+    return fallback;
   }
 }
 
-function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
+function writeJsonFile(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
 }
 
-function normalizePhone(phone) {
-  return String(phone || "").replace(/[^0-9]/g, "");
-}
-
-function toKoreaDateStringFromUnix(unixSeconds) {
-  if (!unixSeconds) return null;
-  const date = new Date(Number(unixSeconds) * 1000);
-  const korea = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-  return korea.toISOString().slice(0, 10);
-}
-
-function toKoreaDateTimeStringFromUnix(unixSeconds) {
-  if (!unixSeconds) return null;
-  const date = new Date(Number(unixSeconds) * 1000);
-  const korea = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-  return korea.toISOString().replace("T", " ").slice(0, 19);
-}
-
-function parseKoreaDateToUtcDate(dateString) {
-  const [y, m, d] = dateString.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d, -9, 0, 0));
-}
-
-function addCalendarOneMonth(dateString) {
-  const [year, month, day] = dateString.split("-").map(Number);
-
-  const targetMonthFirst = new Date(Date.UTC(year, month, 1));
-  const targetYear = targetMonthFirst.getUTCFullYear();
-  const targetMonth = targetMonthFirst.getUTCMonth();
-
-  const lastDayOfTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
-  const validDay = Math.min(day, lastDayOfTargetMonth);
-
-  const mm = String(targetMonth + 1).padStart(2, "0");
-  const dd = String(validDay).padStart(2, "0");
-
-  return `${targetYear}-${mm}-${dd}`;
-}
-
-function isDateWithinInclusive(todayDate, startDate, endDate) {
-  return todayDate >= startDate && todayDate <= endDate;
-}
-
-function nowKoreaDateString() {
-  const now = new Date();
-  const korea = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-  return korea.toISOString().slice(0, 10);
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function sameOrAfterMinute(paymentUnixSeconds, sentAtIso) {
-  if (!paymentUnixSeconds || !sentAtIso) return false;
-
-  const paymentDate = new Date(Number(paymentUnixSeconds) * 1000);
-  const sentDate = new Date(sentAtIso);
-
-  const paymentMinute = Math.floor(paymentDate.getTime() / 60000);
-  const sentMinute = Math.floor(sentDate.getTime() / 60000);
-
-  return paymentMinute >= sentMinute;
+function normalizePhone(value) {
+  return String(value || "").replace(/[^0-9]/g, "");
 }
 
 function includesAnyKeyword(text, keywords) {
-  const value = String(text || "");
-  return keywords.some((keyword) => value.includes(keyword));
+  const source = String(text || "");
+  return keywords.some((keyword) => source.includes(keyword));
 }
 
-async function imwebFetch(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => null);
+function findDeepValue(obj, keys) {
+  if (!obj || typeof obj !== "object") return "";
 
-  if (!response.ok || !data) {
-    throw new Error(`아임웹 API 호출 실패: ${response.status} ${JSON.stringify(data)}`);
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) {
+      return obj[key];
+    }
   }
 
-  if (data.code && Number(data.code) !== 200) {
-    throw new Error(`아임웹 API 오류: ${JSON.stringify(data)}`);
+  for (const value of Object.values(obj)) {
+    if (value && typeof value === "object") {
+      const found = findDeepValue(value, keys);
+      if (found !== "" && found !== undefined && found !== null) return found;
+    }
   }
 
-  return data;
+  return "";
 }
 
-let cachedToken = null;
+function extractList(responseData) {
+  if (!responseData) return [];
+
+  if (Array.isArray(responseData)) return responseData;
+
+  if (Array.isArray(responseData.list)) return responseData.list;
+  if (Array.isArray(responseData.data)) return responseData.data;
+  if (Array.isArray(responseData.items)) return responseData.items;
+
+  if (responseData.data && Array.isArray(responseData.data.list)) return responseData.data.list;
+  if (responseData.result && Array.isArray(responseData.result.list)) return responseData.result.list;
+
+  return [];
+}
 
 async function getImwebAccessToken() {
-  if (cachedToken) return cachedToken;
-
-  const url = `https://api.imweb.me/v2/auth?key=${encodeURIComponent(
-    IMWEB_API_KEY
-  )}&secret=${encodeURIComponent(IMWEB_SECRET_KEY)}`;
-
-  const data = await imwebFetch(url, { method: "GET" });
-
-  if (!data.access_token) {
-    throw new Error(`아임웹 access_token 없음: ${JSON.stringify(data)}`);
+  if (!IMWEB_API_KEY || !IMWEB_SECRET_KEY) {
+    throw new Error("IMWEB_API_KEY 또는 IMWEB_SECRET_KEY가 설정되지 않았습니다.");
   }
 
-  cachedToken = data.access_token;
-  return cachedToken;
+  const url = "https://api.imweb.me/v2/auth";
+
+  const response = await axios.get(url, {
+    params: {
+      key: IMWEB_API_KEY,
+      secret: IMWEB_SECRET_KEY
+    },
+    timeout: 15000
+  });
+
+  const data = response.data;
+
+  if (!data || data.code !== 200 || !data.access_token) {
+    throw new Error(`아임웹 토큰 발급 실패: ${JSON.stringify(data)}`);
+  }
+
+  return data.access_token;
 }
 
-async function callImwebApi(url) {
-  const token = await getImwebAccessToken();
+async function imwebGet(pathname, accessToken, params = {}) {
+  const response = await axios.get(`https://api.imweb.me${pathname}`, {
+    headers: {
+      "access-token": accessToken
+    },
+    params,
+    timeout: 20000
+  });
+
+  return response.data;
+}
+
+async function getMembers(accessToken) {
+  const data = await imwebGet("/v2/member/members", accessToken);
+  return extractList(data);
+}
+
+async function getOrders(accessToken) {
+  const data = await imwebGet("/v2/shop/orders", accessToken);
+  return extractList(data);
+}
+
+async function getProdOrders(accessToken, orderNoOrCode) {
+  if (!orderNoOrCode) return [];
 
   try {
-    return await imwebFetch(url, {
-      method: "GET",
-      headers: {
-        "access-token": token
-      }
-    });
-  } catch (error) {
-    cachedToken = null;
-    const newToken = await getImwebAccessToken();
+    const data = await imwebGet(
+      `/v2/shop/orders/${encodeURIComponent(orderNoOrCode)}/prod-orders`,
+      accessToken,
+      { order_version: ORDER_VERSION }
+    );
 
-    return await imwebFetch(url, {
-      method: "GET",
-      headers: {
-        "access-token": newToken
-      }
-    });
+    return extractList(data);
+  } catch (error) {
+    return [];
   }
 }
 
-async function getMembers() {
-  const url = "https://api.imweb.me/v2/member/members";
-  const data = await callImwebApi(url);
-
-  const list = data?.data?.list || data?.data || [];
-  return Array.isArray(list) ? list : [];
+function getMemberName(member) {
+  return String(
+    findDeepValue(member, [
+      "name",
+      "member_name",
+      "username",
+      "user_name",
+      "nick",
+      "nickname",
+      "display_name"
+    ]) || ""
+  );
 }
 
-async function getOrders() {
-  const url = `https://api.imweb.me/v2/shop/orders?order_version=${encodeURIComponent(ORDER_VERSION)}`;
-  const data = await callImwebApi(url);
-
-  const list = data?.data?.list || data?.data || [];
-  return Array.isArray(list) ? list : [];
+function getMemberPhone(member) {
+  return normalizePhone(
+    findDeepValue(member, [
+      "phone",
+      "mobile",
+      "cellphone",
+      "callnum",
+      "call_num",
+      "phone_number",
+      "member_phone",
+      "tel"
+    ])
+  );
 }
 
-async function getProductOrders(orderNo) {
-  const url = `https://api.imweb.me/v2/shop/orders/${encodeURIComponent(
-    orderNo
-  )}/prod-orders?order_version=${encodeURIComponent(ORDER_VERSION)}`;
-
-  const data = await callImwebApi(url);
-  return Array.isArray(data?.data) ? data.data : [];
+function getMemberEmail(member) {
+  return String(
+    findDeepValue(member, [
+      "email",
+      "member_email",
+      "user_email"
+    ]) || ""
+  );
 }
 
-function findMember(members, input) {
-  const inputName = String(input.name || "").trim();
-  const inputEmail = String(input.email || "").trim().toLowerCase();
-  const inputPhone = normalizePhone(input.phone);
+function matchMember(members, inputName, inputPhone) {
+  const normalizedInputPhone = normalizePhone(inputPhone);
+  const inputNameText = String(inputName || "").trim();
 
   return members.find((member) => {
-    const memberName = String(member.name || "").trim();
-    const memberEmail = String(member.email || member.uid || "").trim().toLowerCase();
-    const memberPhone = normalizePhone(member.callnum);
+    const memberName = getMemberName(member);
+    const memberPhone = getMemberPhone(member);
 
-    if (inputPhone && memberPhone && inputPhone === memberPhone) return true;
-    if (inputEmail && memberEmail && inputEmail === memberEmail) return true;
-    if (inputName && memberName && inputName === memberName) return true;
+    const phoneMatched =
+      normalizedInputPhone &&
+      memberPhone &&
+      memberPhone.includes(normalizedInputPhone);
+
+    const nameMatched =
+      inputNameText &&
+      memberName &&
+      memberName.includes(inputNameText);
+
+    if (normalizedInputPhone && inputNameText) {
+      return phoneMatched && nameMatched;
+    }
+
+    if (normalizedInputPhone) return phoneMatched;
+    if (inputNameText) return nameMatched;
 
     return false;
   });
 }
 
-function filterOrdersByMember(orders, member, input) {
-  const memberCode = member?.member_code;
-  const phone = normalizePhone(input.phone || member?.callnum);
-  const email = String(input.email || member?.email || "").trim().toLowerCase();
-  const name = String(input.name || member?.name || "").trim();
-
-  return orders.filter((order) => {
-    const orderer = order.orderer || {};
-    const orderMemberCode = orderer.member_code;
-    const orderPhone = normalizePhone(orderer.call);
-    const orderEmail = String(orderer.email || "").trim().toLowerCase();
-    const orderName = String(orderer.name || "").trim();
-
-    if (memberCode && orderMemberCode && memberCode === orderMemberCode) return true;
-    if (phone && orderPhone && phone === orderPhone) return true;
-    if (email && orderEmail && email === orderEmail) return true;
-    if (name && orderName && name === orderName) return true;
-
-    return false;
+function getOrderText(order, prodOrders = []) {
+  return JSON.stringify({
+    order,
+    prodOrders
   });
 }
 
-async function enrichOrdersWithProducts(orders) {
-  const result = [];
+function isOrderCompleted(orderText) {
+  const text = String(orderText || "");
 
-  for (const order of orders) {
-    if (!order.order_no) continue;
+  const completedKeywords = [
+    "결제완료",
+    "배송준비",
+    "배송중",
+    "배송완료",
+    "구매확정",
+    "paid",
+    "complete",
+    "completed"
+  ];
 
-    try {
-      const productOrders = await getProductOrders(order.order_no);
-      result.push({
-        ...order,
-        productOrders
-      });
-    } catch (error) {
-      result.push({
-        ...order,
-        productOrders: [],
-        productOrderError: error.message
-      });
-    }
-  }
+  const badKeywords = [
+    "취소",
+    "환불",
+    "반품",
+    "미결제",
+    "입금대기",
+    "cancel",
+    "refund"
+  ];
 
-  return result;
+  const hasCompleted = completedKeywords.some((keyword) =>
+    text.toLowerCase().includes(keyword.toLowerCase())
+  );
+
+  const hasBad = badKeywords.some((keyword) =>
+    text.toLowerCase().includes(keyword.toLowerCase())
+  );
+
+  return hasCompleted && !hasBad;
 }
 
-function flattenPaidItems(enrichedOrders) {
-  const items = [];
+async function analyzeCustomer(accessToken, inputName, inputPhone) {
+  const members = await getMembers(accessToken);
+  const matchedMember = matchMember(members, inputName, inputPhone);
 
-  for (const order of enrichedOrders) {
-    for (const prodOrder of order.productOrders || []) {
-      const status = prodOrder.status || "";
-      const payTime = prodOrder.pay_time || order?.payment?.payment_time || order.order_time;
-
-      for (const item of prodOrder.items || []) {
-        items.push({
-          orderNo: order.order_no,
-          prodOrderNo: prodOrder.order_no,
-          status,
-          payTime,
-          payDate: toKoreaDateStringFromUnix(payTime),
-          payDateTime: toKoreaDateTimeStringFromUnix(payTime),
-          prodName: item.prod_name || "",
-          price: item?.payment?.price || item?.payment?.payment_amount || order?.payment?.payment_amount || 0,
-          raw: item
-        });
-      }
-    }
-  }
-
-  return items;
-}
-
-function judgeSubscription(paidItems) {
-  const subscriptionItems = paidItems
-    .filter((item) => item.status === "COMPLETE")
-    .filter((item) => includesAnyKeyword(item.prodName, SUBSCRIPTION_KEYWORDS))
-    .sort((a, b) => Number(b.payTime || 0) - Number(a.payTime || 0));
-
-  const latest = subscriptionItems[0];
-
-  if (!latest || !latest.payDate) {
+  if (!matchedMember) {
     return {
+      ok: true,
+      isMember: false,
+      canUseService: false,
       subscriptionActive: false,
-      subscriptionPaidDate: null,
-      subscriptionValidUntil: null,
-      subscriptionProduct: null,
-      reason: "정기구독 결제완료 내역이 없습니다."
-    };
-  }
-
-  const paidDate = latest.payDate;
-  const validUntil = addCalendarOneMonth(paidDate);
-  const today = nowKoreaDateString();
-
-  const active = isDateWithinInclusive(today, paidDate, validUntil);
-
-  return {
-    subscriptionActive: active,
-    subscriptionPaidDate: paidDate,
-    subscriptionValidUntil: validUntil,
-    subscriptionProduct: latest.prodName,
-    subscriptionOrderNo: latest.orderNo,
-    reason: active
-      ? "정기구독 결제일 기준 다음 달 같은 날짜까지 유효합니다."
-      : "정기구독 유효기간이 지났습니다."
-  };
-}
-
-function getLatestPaymentRequest(customerKey) {
-  const records = readJsonFile(PAYMENT_REQUEST_FILE, []);
-  const matched = records
-    .filter((record) => record.customerKey === customerKey)
-    .sort((a, b) => new Date(b.sentAt).getTime() - new Date(a.sentAt).getTime());
-
-  return matched[0] || null;
-}
-
-function judgePaidService(paidItems, paymentRequest) {
-  if (!paymentRequest) {
-    return {
       paidServiceCompleted: false,
-      paymentLinkSentAt: null,
-      paidServicePaidAt: null,
-      paidServiceProduct: null,
-      reason: "유료 서비스 결제창 발송 기록이 없습니다."
-    };
-  }
-
-  const paidServiceItems = paidItems
-    .filter((item) => item.status === "COMPLETE")
-    .filter((item) => sameOrAfterMinute(item.payTime, paymentRequest.sentAt))
-    .filter((item) => {
-      if (paymentRequest.productKeyword) {
-        return item.prodName.includes(paymentRequest.productKeyword);
+      reason: "아임웹 회원정보에서 고객을 찾지 못했습니다.",
+      input: {
+        name: inputName || "",
+        phone: inputPhone || ""
       }
-
-      return includesAnyKeyword(item.prodName, PAID_SERVICE_KEYWORDS);
-    })
-    .sort((a, b) => Number(b.payTime || 0) - Number(a.payTime || 0));
-
-  const latest = paidServiceItems[0];
-
-  if (!latest) {
-    return {
-      paidServiceCompleted: false,
-      paymentLinkSentAt: paymentRequest.sentAt,
-      paidServicePaidAt: null,
-      paidServiceProduct: null,
-      reason: "결제창 발송 시각 이후 유료 서비스 결제완료 내역이 없습니다."
     };
   }
 
+  const orders = await getOrders(accessToken);
+
+  const matchedPhone = getMemberPhone(matchedMember);
+  const matchedName = getMemberName(matchedMember);
+  const matchedEmail = getMemberEmail(matchedMember);
+
+  const relatedOrders = orders.filter((order) => {
+    const orderText = JSON.stringify(order);
+    const orderPhone = normalizePhone(orderText);
+
+    const phoneMatched = matchedPhone && orderPhone.includes(matchedPhone);
+    const nameMatched = matchedName && orderText.includes(matchedName);
+    const emailMatched = matchedEmail && orderText.includes(matchedEmail);
+
+    return phoneMatched || nameMatched || emailMatched;
+  });
+
+  const checkedOrders = [];
+
+  for (const order of relatedOrders.slice(0, 10)) {
+    const orderNo =
+      order.order_no ||
+      order.order_code ||
+      order.orderCode ||
+      order.orderNo ||
+      "";
+
+    const prodOrders = await getProdOrders(accessToken, orderNo);
+    const orderText = getOrderText(order, prodOrders);
+
+    checkedOrders.push({
+      order,
+      prodOrders,
+      orderText,
+      isCompleted: isOrderCompleted(orderText),
+      hasSubscriptionKeyword: includesAnyKeyword(orderText, SUBSCRIPTION_KEYWORDS),
+      hasPaidServiceKeyword: includesAnyKeyword(orderText, PAID_SERVICE_KEYWORDS)
+    });
+  }
+
+  const subscriptionActive = checkedOrders.some(
+    (item) => item.hasSubscriptionKeyword && item.isCompleted
+  );
+
+  const paidServiceCompleted = checkedOrders.some(
+    (item) => item.hasPaidServiceKeyword && item.isCompleted
+  );
+
+  const canUseService = subscriptionActive || paidServiceCompleted;
+
   return {
-    paidServiceCompleted: true,
-    paymentLinkSentAt: paymentRequest.sentAt,
-    paidServicePaidAt: latest.payDateTime,
-    paidServiceProduct: latest.prodName,
-    paidServiceOrderNo: latest.orderNo,
-    reason: "결제창 발송 시각 이후 유료 서비스 결제완료가 확인되었습니다."
+    ok: true,
+    isMember: true,
+    canUseService,
+    subscriptionActive,
+    paidServiceCompleted,
+    reason: canUseService
+      ? "이용 가능한 고객입니다."
+      : "회원은 확인되었지만 정기구독 또는 유료 서비스 결제완료 내역을 찾지 못했습니다.",
+    customer: {
+      name: matchedName,
+      phone: matchedPhone,
+      email: matchedEmail
+    },
+    matchedMember,
+    relatedOrderCount: relatedOrders.length,
+    checkedOrders: checkedOrders.map((item) => ({
+      order_no: item.order.order_no || "",
+      order_code: item.order.order_code || "",
+      isCompleted: item.isCompleted,
+      hasSubscriptionKeyword: item.hasSubscriptionKeyword,
+      hasPaidServiceKeyword: item.hasPaidServiceKeyword,
+      prodOrderCount: item.prodOrders.length
+    }))
   };
 }
 
-function makeCustomerKey(input, member) {
-  const phone = normalizePhone(input.phone || member?.callnum);
-  const email = String(input.email || member?.email || "").trim().toLowerCase();
-  const name = String(input.name || member?.name || "").trim();
-
-  if (phone) return `phone:${phone}`;
-  if (email) return `email:${email}`;
-  if (member?.member_code) return `member:${member.member_code}`;
-  if (name) return `name:${name}`;
-
-  return "unknown";
-}
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "kimbiseo-server",
+    message: "김비서 중간서버가 실행 중입니다."
+  });
+});
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    service: "kimbiseo-server",
-    time: nowIso()
-  });
-});
-
-app.post("/payment-link/sent", (req, res) => {
-  const body = req.body || {};
-
-  const customerKey = makeCustomerKey(body, null);
-
-  const records = readJsonFile(PAYMENT_REQUEST_FILE, []);
-
-  const record = {
-    id: `pr_${Date.now()}`,
-    customerKey,
-    name: body.name || "",
-    phone: body.phone || "",
-    email: body.email || "",
-    productKeyword: body.productKeyword || "",
-    paymentLink: body.paymentLink || "",
-    sentAt: nowIso()
-  };
-
-  records.push(record);
-  writeJsonFile(PAYMENT_REQUEST_FILE, records);
-
-  res.json({
-    ok: true,
-    message: "유료 서비스 결제창 발송 시각을 기록했습니다.",
-    paymentRequest: record
+    message: "healthy",
+    time: new Date().toISOString()
   });
 });
 
 app.post("/customer-profile", async (req, res) => {
   try {
-    const input = req.body || {};
+    const body = req.body || {};
+    const name = body.name || body.customerName || "";
+    const phone = body.phone || "";
 
-    const members = await getMembers();
-    const member = findMember(members, input);
+    const accessToken = await getImwebAccessToken();
+    const result = await analyzeCustomer(accessToken, name, phone);
 
-    if (!member) {
-      return res.json({
-        ok: true,
-        isMember: false,
-        canUseService: false,
-        subscriptionActive: false,
-        paidServiceCompleted: false,
-        reason: "아임웹 회원정보에서 고객을 찾지 못했습니다.",
-        input
-      });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/orders/create", async (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const order = {
+      id: Date.now().toString(),
+      createdAt: new Date().toISOString(),
+      customerName: body.customerName || "",
+      phone: body.phone || "",
+      requestSummary: body.requestSummary || "",
+      taskType: body.taskType || "",
+      place: body.place || "",
+      deadline: body.deadline || "",
+      item: body.item || "",
+      budget: body.budget || "",
+      deliveryPlace: body.deliveryPlace || "",
+      photoRequired: body.photoRequired || "",
+      priceType: body.priceType || "",
+      conversationSummary: body.conversationSummary || "",
+      raw: body
+    };
+
+    const orders = readJsonFile(ORDERS_FILE, []);
+    orders.push(order);
+    writeJsonFile(ORDERS_FILE, orders);
+
+    let googleSheet = {
+      sent: false,
+      message: "GOOGLE_SHEET_WEBHOOK_URL이 설정되지 않았습니다."
+    };
+
+    if (GOOGLE_SHEET_WEBHOOK_URL) {
+      try {
+        const sheetResponse = await axios.post(GOOGLE_SHEET_WEBHOOK_URL, order, {
+          headers: {
+            "Content-Type": "application/json"
+          },
+          timeout: 15000
+        });
+
+        googleSheet = {
+          sent: true,
+          status: sheetResponse.status,
+          data: sheetResponse.data
+        };
+      } catch (sheetError) {
+        googleSheet = {
+          sent: false,
+          error: sheetError.response?.data || sheetError.message
+        };
+      }
     }
-
-    const allOrders = await getOrders();
-    const customerOrders = filterOrdersByMember(allOrders, member, input);
-    const enrichedOrders = await enrichOrdersWithProducts(customerOrders);
-    const paidItems = flattenPaidItems(enrichedOrders);
-
-    const subscription = judgeSubscription(paidItems);
-
-    const customerKey = makeCustomerKey(input, member);
-    const latestPaymentRequest = getLatestPaymentRequest(customerKey);
-    const paidService = judgePaidService(paidItems, latestPaymentRequest);
-
-    const canUseSubscriptionService = subscription.subscriptionActive;
 
     res.json({
       ok: true,
-      isMember: true,
-      member: {
-        memberCode: member.member_code,
-        uid: member.uid,
-        name: member.name,
-        email: member.email,
-        phone: member.callnum,
-        joinTime: member.join_time,
-        grade: member.member_grade
-      },
-      subscription,
-      paidService,
-      canUseSubscriptionService,
-      canProceedPaidService: paidService.paidServiceCompleted,
-      recentOrders: customerOrders.slice(0, 5).map((order) => ({
-        orderNo: order.order_no,
-        orderTime: toKoreaDateTimeStringFromUnix(order.order_time),
-        orderer: order.orderer,
-        payment: order.payment
-      })),
-      messageForAgent: buildMessageForAgent(subscription, paidService)
+      message: "오더를 저장했습니다.",
+      order,
+      googleSheet
     });
   } catch (error) {
     res.status(500).json({
@@ -496,61 +465,12 @@ app.post("/customer-profile", async (req, res) => {
   }
 });
 
-function buildMessageForAgent(subscription, paidService) {
-  if (subscription.subscriptionActive && paidService.paidServiceCompleted) {
-    return "정기구독이 유효하고, 유료 서비스 결제도 완료되었습니다.";
-  }
-
-  if (subscription.subscriptionActive && !paidService.paidServiceCompleted) {
-    return "정기구독은 유효합니다. 단, 이번 요청이 유료 서비스라면 유료 결제 완료 여부는 아직 확인되지 않았습니다.";
-  }
-
-  if (!subscription.subscriptionActive && paidService.paidServiceCompleted) {
-    return "정기구독은 유효하지 않지만, 유료 서비스 결제는 완료되었습니다.";
-  }
-
-  return "정기구독 유효 결제와 유료 서비스 결제완료가 확인되지 않았습니다.";
-}
-
-app.post("/orders/create", (req, res) => {
-  const body = req.body || {};
-  const orders = readJsonFile(ORDERS_FILE, []);
-
-  const order = {
-    id: `order_${Date.now()}`,
-    createdAt: nowIso(),
-    status: "received",
-    customerName: body.customerName || body.name || "미확인",
-    phone: body.phone || "미확인",
-    requestSummary: body.requestSummary || "",
-    taskType: body.taskType || "",
-    place: body.place || "",
-    deadline: body.deadline || "",
-    item: body.item || "",
-    budget: body.budget || "",
-    deliveryPlace: body.deliveryPlace || "",
-    photoRequired: body.photoRequired || "",
-    priceType: body.priceType || "",
-    conversationSummary: body.conversationSummary || "",
-    raw: body
-  };
-
-  orders.push(order);
-  writeJsonFile(ORDERS_FILE, orders);
-
-  res.json({
-    ok: true,
-    message: "오더를 저장했습니다.",
-    order
-  });
-});
-
 app.get("/orders", (req, res) => {
   const orders = readJsonFile(ORDERS_FILE, []);
   res.json({
     ok: true,
     count: orders.length,
-    orders: orders.slice().reverse()
+    orders
   });
 });
 
