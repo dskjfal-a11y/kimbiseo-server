@@ -19,12 +19,18 @@ const IMWEB_SECRET_KEY = process.env.IMWEB_SECRET_KEY;
 const ORDER_VERSION = process.env.ORDER_VERSION || "v2";
 const GOOGLE_SHEET_WEBHOOK_URL = process.env.GOOGLE_SHEET_WEBHOOK_URL || "";
 
-const SUBSCRIPTION_KEYWORDS = (process.env.SUBSCRIPTION_KEYWORDS || "정기구독,김비서 고용하기")
+const SUBSCRIPTION_KEYWORDS = (
+  process.env.SUBSCRIPTION_KEYWORDS ||
+  "정기구독,김비서 고용하기,김비서 고용하기(정기구독),김비서 한 달 고용하기"
+)
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
 
-const PAID_SERVICE_KEYWORDS = (process.env.PAID_SERVICE_KEYWORDS || "유료,별도결제,추가결제,유료 서비스")
+const PAID_SERVICE_KEYWORDS = (
+  process.env.PAID_SERVICE_KEYWORDS ||
+  "유료 서비스,유료,별도결제,추가결제"
+)
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
@@ -123,29 +129,45 @@ async function getImwebMembers(accessToken) {
 }
 
 async function getImwebOrders(accessToken) {
-  const data = await imwebGet(accessToken, "https://api.imweb.me/v2/shop/orders", {
-    order_version: ORDER_VERSION,
-  });
-
+  const data = await imwebGet(accessToken, "https://api.imweb.me/v2/shop/orders");
   return flattenArrayFromResponse(data);
 }
 
-async function getImwebProductOrders(accessToken, orderCodeOrNo) {
-  if (!orderCodeOrNo) return [];
+async function getImwebProductOrders(accessToken, order) {
+  const orderNo = order.order_no || order.orderNo || "";
+  const orderCode = order.order_code || order.orderCode || "";
 
-  try {
-    const data = await imwebGet(
-      accessToken,
-      `https://api.imweb.me/v2/shop/orders/${orderCodeOrNo}/prod-orders`,
-      {
-        order_version: ORDER_VERSION,
+  const candidates = [orderNo, orderCode].filter(Boolean);
+
+  for (const orderId of candidates) {
+    try {
+      const data = await imwebGet(
+        accessToken,
+        `https://api.imweb.me/v2/shop/orders/${orderId}/prod-orders`,
+        {
+          order_version: ORDER_VERSION,
+        }
+      );
+
+      const list = flattenArrayFromResponse(data);
+
+      if (list.length > 0) {
+        return {
+          orderIdUsed: orderId,
+          list,
+          raw: data,
+        };
       }
-    );
-
-    return flattenArrayFromResponse(data);
-  } catch (error) {
-    return [];
+    } catch (error) {
+      // 다음 후보 orderId로 재시도
+    }
   }
+
+  return {
+    orderIdUsed: "",
+    list: [],
+    raw: null,
+  };
 }
 
 function findMember(members, inputName, inputPhone) {
@@ -161,19 +183,16 @@ function findMember(members, inputName, inputPhone) {
         "nick",
         "nickname",
         "user_name",
-        "order_name",
       ])
     );
 
     const memberPhone = onlyNumber(
       getValueByKeys(member, [
-        "phone",
         "callnum",
+        "phone",
         "mobile",
         "cellphone",
         "phone_number",
-        "order_call",
-        "order_phone",
       ])
     );
 
@@ -189,31 +208,40 @@ function findMember(members, inputName, inputPhone) {
 }
 
 function orderBelongsToMember(order, member, inputName, inputPhone) {
-  const targetName = normalizeText(inputName);
-  const targetPhone = onlyNumber(inputPhone);
+  const targetName = normalizeText(inputName || member.name);
+  const targetPhone = onlyNumber(inputPhone || member.callnum);
 
-  const memberIdx = getValueByKeys(member, ["idx", "member_idx", "user_idx"]);
-  const memberId = getValueByKeys(member, ["member_id", "userid", "user_id", "id"]);
+  const memberCode = normalizeText(member.member_code);
+  const memberPhone = onlyNumber(member.callnum);
+  const memberName = normalizeText(member.name);
 
-  const orderMemberIdx = getValueByKeys(order, ["member_idx", "user_idx", "memberIdx"]);
-  const orderMemberId = getValueByKeys(order, ["member_id", "userid", "user_id", "id"]);
+  // 아임웹 주문 응답 실제 구조:
+  // order.orderer.member_code
+  // order.orderer.name
+  // order.orderer.call
+  const orderer = order.orderer || {};
 
-  if (memberIdx && orderMemberIdx && String(memberIdx) === String(orderMemberIdx)) return true;
-  if (memberId && orderMemberId && String(memberId) === String(orderMemberId)) return true;
+  const orderMemberCode = normalizeText(orderer.member_code);
+  const orderName = normalizeText(orderer.name);
+  const orderPhone = onlyNumber(orderer.call);
 
-  const orderName = normalizeText(
-    getValueByKeys(order, ["order_name", "name", "buyer_name", "receiver_name"])
-  );
+  if (memberCode && orderMemberCode && memberCode === orderMemberCode) {
+    return true;
+  }
 
-  const orderPhone = onlyNumber(
-    getValueByKeys(order, ["order_call", "order_phone", "phone", "callnum", "mobile"])
-  );
+  if (memberName && orderName && memberPhone && orderPhone) {
+    if (memberName === orderName && memberPhone === orderPhone) {
+      return true;
+    }
+  }
 
-  const nameMatched = targetName && orderName && orderName === targetName;
-  const phoneMatched = targetPhone && orderPhone && orderPhone === targetPhone;
+  if (targetName && orderName && targetPhone && orderPhone) {
+    if (targetName === orderName && targetPhone === orderPhone) {
+      return true;
+    }
+  }
 
-  if (targetName && targetPhone) return nameMatched && phoneMatched;
-  return nameMatched || phoneMatched;
+  return false;
 }
 
 function textIncludesAny(text, keywords) {
@@ -224,7 +252,9 @@ function textIncludesAny(text, keywords) {
 }
 
 function getProductName(productOrder) {
-  return normalizeText(
+  if (!productOrder || typeof productOrder !== "object") return "";
+
+  const directName = normalizeText(
     getValueByKeys(productOrder, [
       "prod_name",
       "product_name",
@@ -232,11 +262,72 @@ function getProductName(productOrder) {
       "title",
       "prodName",
       "item_name",
+      "prod_title",
+      "productTitle",
     ])
   );
+
+  if (directName) return directName;
+
+  if (productOrder.product && typeof productOrder.product === "object") {
+    const nestedName = normalizeText(
+      getValueByKeys(productOrder.product, [
+        "prod_name",
+        "product_name",
+        "name",
+        "title",
+        "prodName",
+        "item_name",
+      ])
+    );
+
+    if (nestedName) return nestedName;
+  }
+
+  if (productOrder.prod && typeof productOrder.prod === "object") {
+    const nestedName = normalizeText(
+      getValueByKeys(productOrder.prod, [
+        "prod_name",
+        "product_name",
+        "name",
+        "title",
+        "prodName",
+        "item_name",
+      ])
+    );
+
+    if (nestedName) return nestedName;
+  }
+
+  return "";
 }
 
-function getOrderStatus(order, productOrders) {
+function getProductStatusText(productOrder) {
+  if (!productOrder || typeof productOrder !== "object") return "";
+
+  const directStatus = normalizeText(
+    getValueByKeys(productOrder, [
+      "status",
+      "order_status",
+      "payment_status",
+      "pay_status",
+      "delivery_status",
+      "prod_order_status",
+      "status_text",
+      "statusText",
+    ])
+  );
+
+  const nestedStatus =
+    normalizeText(productOrder.status?.text) ||
+    normalizeText(productOrder.status?.name) ||
+    normalizeText(productOrder.order_status?.text) ||
+    normalizeText(productOrder.order_status?.name);
+
+  return `${directStatus} ${nestedStatus}`.trim();
+}
+
+function getOrderStatusText(order, productOrders) {
   const orderStatus = normalizeText(
     getValueByKeys(order, [
       "status",
@@ -245,37 +336,76 @@ function getOrderStatus(order, productOrders) {
       "pay_status",
       "delivery_status",
       "prod_order_status",
+      "status_text",
+      "statusText",
     ])
   );
 
   const productStatusText = productOrders
-    .map((p) =>
-      normalizeText(
-        getValueByKeys(p, [
-          "status",
-          "order_status",
-          "payment_status",
-          "pay_status",
-          "delivery_status",
-          "prod_order_status",
-        ])
-      )
-    )
+    .map((p) => getProductStatusText(p))
+    .filter(Boolean)
     .join(" ");
 
-  return `${orderStatus} ${productStatusText}`;
+  return `${orderStatus} ${productStatusText}`.trim();
+}
+
+function isPaidOrder(order) {
+  const payment = order.payment || {};
+
+  const paymentAmount = Number(payment.payment_amount || 0);
+  const totalPrice = Number(payment.total_price || 0);
+  const paymentTime = Number(payment.payment_time || 0);
+
+  // 아임웹 주문 응답상 결제 완료 주문은 payment.payment_time이 0보다 큼
+  if (paymentTime > 0 && paymentAmount > 0) return true;
+
+  // 0원 상품 가능성까지 열어두려면 payment_time만 봐도 됨
+  if (paymentTime > 0 && totalPrice >= 0) return true;
+
+  return false;
 }
 
 function isCompletedPayment(order, productOrders) {
-  const statusText = getOrderStatus(order, productOrders);
+  const statusText = getOrderStatusText(order, productOrders);
 
-  const negativeWords = ["취소", "환불", "반품", "미결제", "입금대기", "실패"];
-  const positiveWords = ["결제완료", "배송준비", "배송중", "배송완료", "구매완료", "완료", "paid"];
+  const negativeWords = [
+    "취소",
+    "환불",
+    "반품",
+    "미결제",
+    "입금대기",
+    "실패",
+    "cancel",
+    "refund",
+    "failed",
+  ];
 
-  if (negativeWords.some((word) => statusText.includes(word))) return false;
-  if (positiveWords.some((word) => statusText.toLowerCase().includes(word.toLowerCase()))) return true;
+  const positiveWords = [
+    "결제완료",
+    "구매확정",
+    "구매 확정",
+    "배송준비",
+    "배송중",
+    "배송완료",
+    "구매완료",
+    "완료",
+    "paid",
+    "complete",
+    "completed",
+  ];
 
-  return true;
+  const lower = statusText.toLowerCase();
+
+  if (negativeWords.some((word) => lower.includes(word.toLowerCase()))) {
+    return false;
+  }
+
+  if (positiveWords.some((word) => lower.includes(word.toLowerCase()))) {
+    return true;
+  }
+
+  // 상태값이 비어 있어도 payment_time/payment_amount가 있으면 결제된 것으로 판단
+  return isPaidOrder(order);
 }
 
 async function analyzeCustomer(inputName, inputPhone) {
@@ -300,6 +430,7 @@ async function analyzeCustomer(inputName, inputPhone) {
   }
 
   const orders = await getImwebOrders(accessToken);
+
   const matchedOrders = orders.filter((order) =>
     orderBelongsToMember(order, member, inputName, inputPhone)
   );
@@ -309,22 +440,26 @@ async function analyzeCustomer(inputName, inputPhone) {
   let matchedProducts = [];
 
   for (const order of matchedOrders) {
-    const orderCode =
-      getValueByKeys(order, ["order_code", "orderCode", "code"]) ||
-      getValueByKeys(order, ["order_no", "orderNo", "no"]);
+    const productOrderResult = await getImwebProductOrders(accessToken, order);
+    const productOrders = productOrderResult.list || [];
 
-    const productOrders = await getImwebProductOrders(accessToken, orderCode);
+    const orderNo = order.order_no || "";
+    const orderCode = order.order_code || "";
 
     for (const product of productOrders) {
       const productName = getProductName(product);
       const completed = isCompletedPayment(order, productOrders);
 
-      matchedProducts.push({
+      const productResult = {
+        orderNo,
         orderCode,
+        orderIdUsed: productOrderResult.orderIdUsed,
         productName,
         completed,
         raw: product,
-      });
+      };
+
+      matchedProducts.push(productResult);
 
       if (completed && textIncludesAny(productName, SUBSCRIPTION_KEYWORDS)) {
         subscriptionActive = true;
@@ -333,6 +468,19 @@ async function analyzeCustomer(inputName, inputPhone) {
       if (completed && textIncludesAny(productName, PAID_SERVICE_KEYWORDS)) {
         paidServiceCompleted = true;
       }
+    }
+
+    // 품목 주문 API가 빈 배열이어도 주문 자체에 결제금액/결제시간이 있으면
+    // 최소한 유료 서비스 결제 여부를 놓치지 않도록 처리
+    if (productOrders.length === 0 && isPaidOrder(order)) {
+      matchedProducts.push({
+        orderNo,
+        orderCode,
+        orderIdUsed: productOrderResult.orderIdUsed,
+        productName: "",
+        completed: true,
+        raw: null,
+      });
     }
   }
 
@@ -354,6 +502,13 @@ async function analyzeCustomer(inputName, inputPhone) {
     member,
     orders: matchedOrders,
     products: matchedProducts,
+    debug: {
+      totalOrders: orders.length,
+      matchedOrders: matchedOrders.length,
+      matchedProducts: matchedProducts.length,
+      subscriptionKeywords: SUBSCRIPTION_KEYWORDS,
+      paidServiceKeywords: PAID_SERVICE_KEYWORDS,
+    },
   };
 }
 
