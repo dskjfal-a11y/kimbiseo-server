@@ -215,10 +215,6 @@ function orderBelongsToMember(order, member, inputName, inputPhone) {
   const memberPhone = onlyNumber(member.callnum);
   const memberName = normalizeText(member.name);
 
-  // 아임웹 주문 응답 실제 구조:
-  // order.orderer.member_code
-  // order.orderer.name
-  // order.orderer.call
   const orderer = order.orderer || {};
 
   const orderMemberCode = normalizeText(orderer.member_code);
@@ -268,6 +264,29 @@ function getProductName(productOrder) {
   );
 
   if (directName) return directName;
+
+  if (Array.isArray(productOrder.items) && productOrder.items.length > 0) {
+    const itemNames = productOrder.items
+      .map((item) =>
+        normalizeText(
+          getValueByKeys(item, [
+            "prod_name",
+            "product_name",
+            "name",
+            "title",
+            "prodName",
+            "item_name",
+            "prod_title",
+            "productTitle",
+          ])
+        )
+      )
+      .filter(Boolean);
+
+    if (itemNames.length > 0) {
+      return itemNames.join(" ");
+    }
+  }
 
   if (productOrder.product && typeof productOrder.product === "object") {
     const nestedName = normalizeText(
@@ -356,10 +375,7 @@ function isPaidOrder(order) {
   const totalPrice = Number(payment.total_price || 0);
   const paymentTime = Number(payment.payment_time || 0);
 
-  // 아임웹 주문 응답상 결제 완료 주문은 payment.payment_time이 0보다 큼
   if (paymentTime > 0 && paymentAmount > 0) return true;
-
-  // 0원 상품 가능성까지 열어두려면 payment_time만 봐도 됨
   if (paymentTime > 0 && totalPrice >= 0) return true;
 
   return false;
@@ -404,7 +420,6 @@ function isCompletedPayment(order, productOrders) {
     return true;
   }
 
-  // 상태값이 비어 있어도 payment_time/payment_amount가 있으면 결제된 것으로 판단
   return isPaidOrder(order);
 }
 
@@ -470,8 +485,6 @@ async function analyzeCustomer(inputName, inputPhone) {
       }
     }
 
-    // 품목 주문 API가 빈 배열이어도 주문 자체에 결제금액/결제시간이 있으면
-    // 최소한 유료 서비스 결제 여부를 놓치지 않도록 처리
     if (productOrders.length === 0 && isPaidOrder(order)) {
       matchedProducts.push({
         orderNo,
